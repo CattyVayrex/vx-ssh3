@@ -15,12 +15,13 @@ VX-SSH creates a secure tunnel between two servers using SSH protocol:
 
 ## Features
 
-- **High Performance**: Optimized for speed with concurrent packet processing
-- **Lightweight**: Minimal overhead and resource usage
-- **Real-time**: No packet loss with proper connection management
-- **Multi-connection**: Handles multiple clients simultaneously
+- **High Performance**: Optimized for speed with worker pools, connection pooling, and buffer reuse
+- **Lightweight**: Minimal overhead and resource usage with reduced GC pressure
+- **Real-time**: No packet loss with proper connection management and buffering
+- **Multi-connection**: Handles multiple clients simultaneously with concurrent processing
 - **Simple Setup**: Easy configuration with command-line arguments
 - **Auto-cleanup**: Automatic cleanup of idle connections
+- **Advanced Optimizations**: SSH connection pooling, UDP connection pooling, and memory pool usage
 
 ## Installation
 
@@ -70,6 +71,8 @@ Run the server on your England server that has access to the Wireguard server:
 - `-ssh-password`: SSH password (required)
 - `-max-conns`: Maximum concurrent connections (default: 100)
 - `-idle-timeout`: Connection idle timeout (default: 3m)
+- `-workers`: Number of worker goroutines (default: auto = CPU cores × 2)
+- `-udp-pool-size`: UDP connection pool size (default: 20)
 
 **Example:**
 ```bash
@@ -91,6 +94,8 @@ Run the client on your Iran server where Wireguard clients connect:
 - `-ssh-password`: SSH password (required)
 - `-max-conns`: Maximum concurrent connections (default: 100)
 - `-idle-timeout`: Connection idle timeout (default: 3m)
+- `-workers`: Number of worker goroutines (default: auto = CPU cores × 2)
+- `-pool-size`: SSH connection pool size (default: 10)
 
 **Example:**
 ```bash
@@ -228,13 +233,40 @@ The applications provide detailed logging. Monitor logs for:
 - Performance metrics
 - Cleanup activities
 
+### Performance Optimizations
+
+VX-SSH includes several performance optimizations for maximum throughput:
+
+### Built-in Optimizations
+- **Worker Pools**: Concurrent packet processing with configurable worker count
+- **Connection Pooling**: SSH connection reuse (client) and UDP connection reuse (server)
+- **Buffer Pools**: Memory reuse to reduce garbage collection pressure
+- **Atomic Operations**: Lock-free counters and timestamps for better concurrency
+- **Non-blocking I/O**: Prevent packet drops during high traffic
+- **Socket Buffers**: Optimized UDP and SSH buffer sizes (4MB read/write)
+
 ### Performance Tuning
 
 For high-traffic scenarios:
-- Increase `-max-conns` parameter
-- Adjust `-idle-timeout` based on usage patterns
-- Monitor system resources (CPU, memory, network)
-- Consider load balancing multiple instances
+- **Increase workers**: `-workers 16` (or 2-4x your CPU cores)
+- **Increase pool sizes**: 
+  - Client: `-pool-size 20` (more SSH connections)
+  - Server: `-udp-pool-size 50` (more UDP connections)
+- **Adjust timeouts**: `-idle-timeout 5m` for longer-lived connections
+- **Monitor resources**: CPU, memory, and network utilization
+- **Consider load balancing**: Multiple instances for extreme loads
+
+### Example High-Performance Configuration
+
+**High-traffic server:**
+```bash
+./vx-server -ssh-user myuser -ssh-password mypass -workers 16 -udp-pool-size 50
+```
+
+**High-traffic client:**
+```bash
+./vx-client -remote server.com:22 -ssh-user myuser -ssh-password mypass -workers 16 -pool-size 20
+```
 
 ## Technical Details
 
@@ -245,10 +277,12 @@ For high-traffic scenarios:
 - Automatic connection pooling and cleanup
 
 ### Performance Optimizations
-- Concurrent packet processing with goroutines
-- Connection reuse for multiple packets
-- Efficient memory management
-- Minimal protocol overhead
+- **Worker Pool Architecture**: Fixed number of worker goroutines process packets concurrently
+- **Connection Pooling**: Pre-allocated SSH and UDP connections reduce setup overhead
+- **Memory Pool Usage**: Buffer reuse via sync.Pool reduces GC pressure and allocations
+- **Lock-free Operations**: Atomic operations for counters and timestamps improve concurrency
+- **Optimized I/O**: Large socket buffers (4MB) and non-blocking packet processing
+- **Minimal Protocol Overhead**: Simple 4-byte length prefix with direct packet forwarding
 
 ### Security Features
 - All traffic encrypted through SSH
