@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -20,67 +21,36 @@ import (
 
 // ServerConfig holds server configuration
 type ServerConfig struct {
-	SSHPort       int    // SSH server port (default: 22)
-	TargetAddr    string // Target UDP address (default: 127.0.0.1:51820)
-	SSHUser       string // Expected SSH username
-	SSHPassword   string // Expected SSH password
-	MaxConns      int    // Maximum concurrent connections
-	IdleTimeout   time.Duration
+	SSHPort     int           // SSH server port (default: 22)
+	TargetAddr  string        // Target UDP address (default: 127.0.0.1:51820)
+	SSHUser     string        // Expected SSH username
+	SSHPassword string        // Expected SSH password
+	MaxConns    int           // Maximum concurrent connections
+	IdleTimeout time.Duration // Connection idle timeout
 }
 
-// Packet represents a UDP packet with client info (server side)
-type Packet struct {
-	ClientAddr string
-	Data       []byte
-	Length     int
-}
-
-// ServerConnection represents a client connection (optimized)
-type ServerConnection struct {
-	sshChan      ssh.Channel
-	udpConn      *net.UDPConn
-	targetAddr   *net.UDPAddr
-	sendQueue    chan *Packet
-	recvQueue    chan *Packet
-	clientID     string
-	ctx          context.Context
-	cancel       context.CancelFunc
-}
-
-// VXServer represents the main server (optimized)
+// VXServer represents the main server
 type VXServer struct {
-	config       *ServerConfig
-	connections  map[string]*ServerConnection
-	connMutex    sync.RWMutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	packetPool   sync.Pool
-	bufferPool   sync.Pool
+	config *ServerConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	bufferPool sync.Pool // Added for optimization
 }
 
-// NewVXServer creates a new server instance (optimized)
+// NewVXServer creates a new server instance
 func NewVXServer(config *ServerConfig) (*VXServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	server := &VXServer{
-		config:      config,
-		connections: make(map[string]*ServerConnection),
-		ctx:         ctx,
-		cancel:      cancel,
+		config: config,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
-	// Initialize buffer pools
+	// Initialize buffer pool for optimization (safe addition)
 	server.bufferPool = sync.Pool{
 		New: func() interface{} {
 			return make([]byte, 65535)
-		},
-	}
-
-	server.packetPool = sync.Pool{
-		New: func() interface{} {
-			return &Packet{
-				Data: make([]byte, 65535),
-			}
 		},
 	}
 
@@ -121,9 +91,6 @@ func (s *VXServer) Start() error {
 
 	log.Printf("VX-Server listening on SSH port %d", s.config.SSHPort)
 	log.Printf("Target UDP address: %s", s.config.TargetAddr)
-
-	// Start connection monitor
-	go s.connectionMonitor()
 
 	// Accept connections
 	for {
@@ -175,11 +142,11 @@ func (s *VXServer) handleSSHConnection(conn net.Conn, sshConfig *ssh.ServerConfi
 	}
 }
 
-// handleChannel processes data from an SSH channel (optimized)
+// handleChannel processes data from an SSH channel
 func (s *VXServer) handleChannel(sshChan ssh.Channel, targetAddr *net.UDPAddr, clientID string) {
 	defer sshChan.Close()
 
-	// Create UDP connection to target with optimized settings
+	// Create UDP connection to target
 	udpConn, err := net.DialUDP("udp", nil, targetAddr)
 	if err != nil {
 		log.Printf("Failed to connect to target %s: %v", targetAddr, err)
@@ -187,7 +154,7 @@ func (s *VXServer) handleChannel(sshChan ssh.Channel, targetAddr *net.UDPAddr, c
 	}
 	defer udpConn.Close()
 
-	// Set UDP buffer sizes for performance
+	// Set socket buffer sizes for better performance (safe optimization)
 	if err := udpConn.SetReadBuffer(1024 * 1024); err != nil {
 		log.Printf("Warning: Could not set UDP read buffer: %v", err)
 	}
@@ -195,290 +162,141 @@ func (s *VXServer) handleChannel(sshChan ssh.Channel, targetAddr *net.UDPAddr, c
 		log.Printf("Warning: Could not set UDP write buffer: %v", err)
 	}
 
-	log.Printf("Created optimized UDP connection to %s for client %s", targetAddr, clientID)
+	log.Printf("Created UDP connection to %s for client %s", targetAddr, clientID)
 
-	// Create connection context
+	// Start forwarding goroutines
 	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
 
-	// Create connection object
-	conn := &ServerConnection{
-		sshChan:    sshChan,
-		udpConn:    udpConn,
-		targetAddr: targetAddr,
-		sendQueue:  make(chan *Packet, 500),
-		recvQueue:  make(chan *Packet, 500),
-		clientID:   clientID,
-		ctx:        ctx,
-		cancel:     cancel,
-	}
-
-	// Store connection
-	s.connMutex.Lock()
-	s.connections[clientID] = conn
-	s.connMutex.Unlock()
-
-	// Start processing goroutines
-	go s.sshSender(conn)     // SSH -> UDP
-	go s.sshReceiver(conn)   // UDP -> SSH  
-	go s.udpReceiver(conn)   // UDP responses
+	// SSH to UDP
+	go s.forwardSSHToUDP(ctx, sshChan, udpConn, clientID)
+	// UDP to SSH
+	go s.forwardUDPToSSH(ctx, udpConn, sshChan, clientID)
 
 	// Wait for context cancellation
 	<-ctx.Done()
-	s.removeConnection(clientID)
 }
 
-// sshSender handles sending packets from SSH to UDP (optimized)
-func (s *VXServer) sshSender(conn *ServerConnection) {
-	defer conn.cancel()
-
-	buffer := make([]byte, 65535)
+// forwardSSHToUDP forwards packets from SSH to UDP
+func (s *VXServer) forwardSSHToUDP(ctx context.Context, sshChan ssh.Channel, udpConn *net.UDPConn, clientID string) {
+	buffer := s.bufferPool.Get().([]byte)
+	defer s.bufferPool.Put(buffer)
 
 	for {
 		select {
-		case <-conn.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
 
 		// Read from SSH channel
-		n, err := conn.sshChan.Read(buffer)
+		n, err := sshChan.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Error reading from SSH for %s: %v", conn.clientID, err)
+				log.Printf("Error reading from SSH for %s: %v", clientID, err)
 			}
 			return
 		}
 
-		// Parse batched data and forward to UDP
-		s.parseAndForwardToUDP(conn, buffer[:n])
-	}
-}
-
-// parseAndForwardToUDP parses batched data and forwards to UDP
-func (s *VXServer) parseAndForwardToUDP(conn *ServerConnection, data []byte) {
-	offset := 0
-	
-	for offset < len(data) {
-		if offset+2 > len(data) {
-			break
+		// Parse packet: [addr_len(2)][addr][data_len(4)][data]
+		if n < 6 {
+			continue
 		}
 
+		offset := 0
+		
 		// Read address length
-		addrLen := int(data[offset])<<8 | int(data[offset+1])
+		addrLen := binary.BigEndian.Uint16(buffer[offset:offset+2])
 		offset += 2
 
-		if offset+addrLen > len(data) {
-			break
+		if offset+int(addrLen) > n {
+			continue
 		}
 
-		// Skip address (not needed for server side)
-		offset += addrLen
+		// Skip address (we don't need it on server side)
+		offset += int(addrLen)
 
-		if offset+4 > len(data) {
-			break
+		if offset+4 > n {
+			continue
 		}
 
 		// Read data length
-		dataLen := int(data[offset])<<24 | int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
+		dataLen := binary.BigEndian.Uint32(buffer[offset:offset+4])
 		offset += 4
 
-		if offset+dataLen > len(data) {
-			break
+		if offset+int(dataLen) > n {
+			continue
 		}
 
-		// Forward directly to UDP target
-		if _, err := conn.udpConn.Write(data[offset:offset+dataLen]); err != nil {
-			log.Printf("Error forwarding to UDP: %v", err)
-		}
-		
-		offset += dataLen
-	}
-}
-
-// udpReceiver reads responses from UDP target (optimized)
-func (s *VXServer) udpReceiver(conn *ServerConnection) {
-	for {
-		select {
-		case <-conn.ctx.Done():
-			return
-		default:
-		}
-
-		// Get buffer from pool
-		buffer := s.bufferPool.Get().([]byte)
-
-		// Read from UDP target
-		n, err := conn.udpConn.Read(buffer)
+		// Forward to UDP target
+		_, err = udpConn.Write(buffer[offset:offset+int(dataLen)])
 		if err != nil {
-			s.bufferPool.Put(buffer)
-			log.Printf("Error reading UDP response for %s: %v", conn.clientID, err)
+			log.Printf("Error writing to UDP for %s: %v", clientID, err)
 			return
-		}
-
-		// Get packet from pool
-		packet := s.packetPool.Get().(*Packet)
-		packet.ClientAddr = conn.clientID
-		packet.Length = n
-		copy(packet.Data[:n], buffer[:n])
-
-		// Return buffer to pool
-		s.bufferPool.Put(buffer)
-
-		// Queue for SSH sending
-		select {
-		case conn.recvQueue <- packet:
-		default:
-			s.packetPool.Put(packet) // Queue full, drop packet
 		}
 	}
 }
 
-// sshReceiver handles sending UDP responses back via SSH (optimized)
-func (s *VXServer) sshReceiver(conn *ServerConnection) {
-	batch := make([]*Packet, 0, 10)
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-conn.ctx.Done():
-			return
-
-		case packet := <-conn.recvQueue:
-			batch = append(batch, packet)
-			
-			// Send batch if full
-			if len(batch) >= cap(batch) {
-				s.sendBatchToSSH(conn, batch)
-				batch = batch[:0]
-			}
-
-		case <-ticker.C:
-			// Send batch on timer
-			if len(batch) > 0 {
-				s.sendBatchToSSH(conn, batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
-
-// sendBatchToSSH sends batched packets via SSH
-func (s *VXServer) sendBatchToSSH(conn *ServerConnection, batch []*Packet) {
-	// Get buffer from pool
+// forwardUDPToSSH forwards packets from UDP to SSH
+func (s *VXServer) forwardUDPToSSH(ctx context.Context, udpConn *net.UDPConn, sshChan ssh.Channel, clientID string) {
 	buffer := s.bufferPool.Get().([]byte)
 	defer s.bufferPool.Put(buffer)
 
-	offset := 0
-	for _, packet := range batch {
-		// Write client address length and address
-		addrBytes := []byte(packet.ClientAddr)
-		buffer[offset] = byte(len(addrBytes) >> 8)
-		buffer[offset+1] = byte(len(addrBytes))
-		offset += 2
-		copy(buffer[offset:], addrBytes)
-		offset += len(addrBytes)
-
-		// Write data length and data
-		buffer[offset] = byte(packet.Length >> 24)
-		buffer[offset+1] = byte(packet.Length >> 16)
-		buffer[offset+2] = byte(packet.Length >> 8)
-		buffer[offset+3] = byte(packet.Length)
-		offset += 4
-		copy(buffer[offset:], packet.Data[:packet.Length])
-		offset += packet.Length
-
-		// Return packet to pool
-		s.packetPool.Put(packet)
-	}
-
-	// Send entire batch
-	if _, err := conn.sshChan.Write(buffer[:offset]); err != nil {
-		log.Printf("Error sending batch to SSH: %v", err)
-		conn.cancel() // Close connection on error
-	}
-}
-
-// removeConnection removes and closes a connection (optimized)
-func (s *VXServer) removeConnection(clientID string) {
-	s.connMutex.Lock()
-	defer s.connMutex.Unlock()
-
-	if conn, exists := s.connections[clientID]; exists {
-		log.Printf("Removing connection for client %s", clientID)
-		conn.cancel() // Cancel context first
-		conn.sshChan.Close()
-		conn.udpConn.Close()
-		close(conn.sendQueue)
-		close(conn.recvQueue)
-		delete(s.connections, clientID)
-	}
-}
-
-// connectionMonitor monitors connection health and removes dead connections
-func (s *VXServer) connectionMonitor() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.checkConnections()
-		}
-	}
-}
-
-// checkConnections removes dead connections (optimized)
-func (s *VXServer) checkConnections() {
-	var toRemove []string
-
-	s.connMutex.RLock()
-	for clientID, conn := range s.connections {
-		select {
-		case <-conn.ctx.Done():
-			toRemove = append(toRemove, clientID)
 		default:
 		}
-	}
-	s.connMutex.RUnlock()
 
-	for _, clientID := range toRemove {
-		s.removeConnection(clientID)
-	}
+		// Read from UDP
+		n, err := udpConn.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading from UDP for %s: %v", clientID, err)
+			}
+			return
+		}
 
-	if len(toRemove) > 0 {
-		log.Printf("Cleaned up %d dead connections", len(toRemove))
+		// Forward directly to SSH (no need to re-encode)
+		_, err = sshChan.Write(buffer[:n])
+		if err != nil {
+			log.Printf("Error writing to SSH for %s: %v", clientID, err)
+			return
+		}
 	}
 }
 
-// generateHostKey creates a temporary RSA host key
+// Stop gracefully stops the server
+func (s *VXServer) Stop() {
+	log.Printf("Stopping VX-Server...")
+	s.cancel()
+	log.Printf("VX-Server stopped")
+}
+
+// generateHostKey generates a temporary RSA host key
 func generateHostKey() (ssh.Signer, error) {
-	// Generate RSA private key
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate RSA key: %v", err)
+		return nil, err
 	}
 
-	// Convert to PEM format
 	privateKeyPEM := &pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
 	}
 
 	privateKeyBytes := pem.EncodeToMemory(privateKeyPEM)
-
-	// Parse into SSH signer
 	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %v", err)
+		return nil, err
 	}
 
 	return signer, nil
 }
 
 func main() {
+	// Command line flags
 	var (
 		sshPort     = flag.Int("ssh-port", 22, "SSH server port")
 		targetAddr  = flag.String("target", "127.0.0.1:51820", "Target UDP address")
@@ -489,12 +307,18 @@ func main() {
 	)
 	flag.Parse()
 
-	if *sshUser == "" || *sshPassword == "" {
-		fmt.Fprintf(os.Stderr, "Error: -ssh-user and -ssh-password are required\n")
+	// Validate required parameters
+	if *sshUser == "" {
+		fmt.Fprintf(os.Stderr, "Error: -ssh-user is required\n")
 		fmt.Fprintf(os.Stderr, "Usage: %s -ssh-user <username> -ssh-password <password>\n", os.Args[0])
 		os.Exit(1)
 	}
+	if *sshPassword == "" {
+		fmt.Fprintf(os.Stderr, "Error: -ssh-password is required\n")
+		os.Exit(1)
+	}
 
+	// Create server configuration
 	config := &ServerConfig{
 		SSHPort:     *sshPort,
 		TargetAddr:  *targetAddr,
@@ -504,11 +328,22 @@ func main() {
 		IdleTimeout: *idleTimeout,
 	}
 
+	// Create and start server
 	server, err := NewVXServer(config)
 	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
+		log.Fatalf("Failed to create VX server: %v", err)
 	}
 
+	// Handle graceful shutdown
+	go func() {
+		// Simple signal handling - in production, use os/signal
+		var input string
+		fmt.Scanln(&input)
+		server.Stop()
+		os.Exit(0)
+	}()
+
+	// Start server
 	if err := server.Start(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}

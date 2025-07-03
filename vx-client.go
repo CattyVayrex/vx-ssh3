@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -16,41 +17,37 @@ import (
 
 // Configuration for the client
 type ClientConfig struct {
-	LocalPort    int           // Port to listen for UDP packets (default: 51820)
-	RemoteAddr   string        // SSH server address (e.g., "server.example.com:22")
-	SSHUser      string        // SSH username
-	SSHPassword  string        // SSH password
-	MaxConns     int           // Maximum concurrent connections (default: 100)
+	LocalPort    int    // Port to listen for UDP packets (default: 51820)
+	RemoteAddr   string // SSH server address (e.g., "server.example.com:22")
+	SSHUser      string // SSH username
+	SSHPassword  string // SSH password
+	MaxConns     int    // Maximum concurrent connections (default: 100)
 	IdleTimeout  time.Duration // Connection idle timeout (default: 3 minutes)
 }
 
-// Packet represents a UDP packet with client info
-type Packet struct {
-	ClientAddr *net.UDPAddr
-	Data       []byte
-	Length     int
+// ClientConnection represents a UDP client connection
+type ClientConnection struct {
+	udpAddr    *net.UDPAddr
+	sshConn    ssh.Conn
+	sshChan    ssh.Channel
+	lastActive time.Time
+	mutex      sync.RWMutex
+	bufferPool sync.Pool // Added for optimization
 }
 
-// VXClient represents the main client structure (optimized)
+// VXClient represents the main client structure
 type VXClient struct {
-	config       *ClientConfig
-	udpListener  *net.UDPConn
-	sshConn      ssh.Conn
-	sshChan      ssh.Channel
-	sshConfig    *ssh.ClientConfig
-	ctx          context.Context
-	cancel       context.CancelFunc
-	packetPool   sync.Pool
-	bufferPool   sync.Pool
-	clientMap    map[string]*net.UDPAddr
-	clientMutex  sync.RWMutex
-	sendQueue    chan *Packet
-	recvQueue    chan *Packet
-	connected    bool
-	connMutex    sync.RWMutex
+	config      *ClientConfig
+	udpListener *net.UDPConn
+	connections map[string]*ClientConnection
+	connMutex   sync.RWMutex
+	sshConfig   *ssh.ClientConfig
+	ctx         context.Context
+	cancel      context.CancelFunc
+	bufferPool  sync.Pool // Added for optimization
 }
 
-// NewVXClient creates a new VX client instance (optimized)
+// NewVXClient creates a new VX client instance
 func NewVXClient(config *ClientConfig) (*VXClient, error) {
 	// Create SSH client configuration
 	sshConfig := &ssh.ClientConfig{
@@ -58,44 +55,33 @@ func NewVXClient(config *ClientConfig) (*VXClient, error) {
 		Auth: []ssh.AuthMethod{
 			ssh.Password(config.SSHPassword),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         5 * time.Second, // Reduced timeout
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // For simplicity, ignore host key verification
+		Timeout:         10 * time.Second,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &VXClient{
-		config:     config,
-		sshConfig:  sshConfig,
-		ctx:        ctx,
-		cancel:     cancel,
-		clientMap:  make(map[string]*net.UDPAddr),
-		sendQueue:  make(chan *Packet, 1000), // Buffered channel for batching
-		recvQueue:  make(chan *Packet, 1000),
-		connected:  false,
+		config:      config,
+		connections: make(map[string]*ClientConnection),
+		sshConfig:   sshConfig,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
-	// Initialize buffer pools for better memory management
+	// Initialize buffer pool for optimization (safe addition)
 	client.bufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 65535) // Max UDP packet size
-		},
-	}
-
-	client.packetPool = sync.Pool{
-		New: func() interface{} {
-			return &Packet{
-				Data: make([]byte, 65535),
-			}
+			return make([]byte, 65535)
 		},
 	}
 
 	return client, nil
 }
 
-// Start begins listening for UDP packets and handling connections (optimized)
+// Start begins listening for UDP packets and handling connections
 func (c *VXClient) Start() error {
-	// Start UDP listener with optimized socket options
+	// Start UDP listener
 	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", c.config.LocalPort))
 	if err != nil {
 		return fmt.Errorf("failed to resolve UDP address: %v", err)
@@ -106,7 +92,7 @@ func (c *VXClient) Start() error {
 		return fmt.Errorf("failed to listen on UDP port %d: %v", c.config.LocalPort, err)
 	}
 
-	// Set socket buffer sizes for better performance
+	// Set socket buffer sizes for better performance (safe optimization)
 	if err := c.udpListener.SetReadBuffer(1024 * 1024); err != nil {
 		log.Printf("Warning: Could not set UDP read buffer: %v", err)
 	}
@@ -117,22 +103,14 @@ func (c *VXClient) Start() error {
 	log.Printf("VX-Client listening on UDP port %d", c.config.LocalPort)
 	log.Printf("SSH target: %s (user: %s)", c.config.RemoteAddr, c.config.SSHUser)
 
-	// Establish single SSH connection
-	if err := c.connectSSH(); err != nil {
-		return fmt.Errorf("failed to establish SSH connection: %v", err)
-	}
-
-	// Start processing routines
-	go c.sshSender()     // Handles sending to SSH
-	go c.sshReceiver()   // Handles receiving from SSH
-	go c.udpSender()     // Handles sending UDP responses
-	go c.reconnectLoop() // Handles SSH reconnection
+	// Start connection cleanup routine
+	go c.cleanupRoutine()
 
 	// Main UDP packet handling loop
 	return c.handleUDPPackets()
 }
 
-// handleUDPPackets processes incoming UDP packets (optimized)
+// handleUDPPackets processes incoming UDP packets
 func (c *VXClient) handleUDPPackets() error {
 	for {
 		select {
@@ -141,7 +119,7 @@ func (c *VXClient) handleUDPPackets() error {
 		default:
 		}
 
-		// Get buffer from pool
+		// Get buffer from pool (optimization)
 		buffer := c.bufferPool.Get().([]byte)
 
 		// Read UDP packet
@@ -155,339 +133,238 @@ func (c *VXClient) handleUDPPackets() error {
 			continue
 		}
 
-		// Get packet from pool and prepare for sending
-		packet := c.packetPool.Get().(*Packet)
-		packet.ClientAddr = clientAddr
-		packet.Length = n
-		copy(packet.Data[:n], buffer[:n])
-
-		// Return buffer to pool immediately
-		c.bufferPool.Put(buffer)
-
-		// Store client mapping for responses
-		clientKey := clientAddr.String()
-		c.clientMutex.Lock()
-		c.clientMap[clientKey] = clientAddr
-		c.clientMutex.Unlock()
-
-		// Send to processing queue (non-blocking)
-		select {
-		case c.sendQueue <- packet:
-		default:
-			// Queue full, drop packet and return to pool
-			c.packetPool.Put(packet)
-			log.Printf("Send queue full, dropping packet from %s", clientKey)
-		}
+		// Handle packet in goroutine for concurrent processing
+		go func() {
+			defer c.bufferPool.Put(buffer) // Return buffer when done
+			c.handlePacket(clientAddr, buffer[:n])
+		}()
 	}
 }
 
-// connectSSH establishes the SSH connection and channel
-func (c *VXClient) connectSSH() error {
-	log.Printf("Establishing SSH connection to %s", c.config.RemoteAddr)
+// handlePacket processes a single UDP packet
+func (c *VXClient) handlePacket(clientAddr *net.UDPAddr, data []byte) {
+	clientKey := clientAddr.String()
+
+	// Get or create connection for this client
+	conn, err := c.getOrCreateConnection(clientKey, clientAddr)
+	if err != nil {
+		log.Printf("Failed to get connection for %s: %v", clientKey, err)
+		return
+	}
+
+	// Update last active time
+	conn.mutex.Lock()
+	conn.lastActive = time.Now()
+	conn.mutex.Unlock()
+
+	// Send packet through SSH tunnel
+	if err := c.sendPacket(conn, data); err != nil {
+		log.Printf("Failed to send packet for %s: %v", clientKey, err)
+		c.removeConnection(clientKey)
+	}
+}
+
+// getOrCreateConnection gets existing connection or creates a new one
+func (c *VXClient) getOrCreateConnection(clientKey string, clientAddr *net.UDPAddr) (*ClientConnection, error) {
+	c.connMutex.RLock()
+	if conn, exists := c.connections[clientKey]; exists {
+		c.connMutex.RUnlock()
+		return conn, nil
+	}
+	c.connMutex.RUnlock()
+
+	// Create new connection
+	return c.createConnection(clientKey, clientAddr)
+}
+
+// createConnection establishes a new SSH connection for a client
+func (c *VXClient) createConnection(clientKey string, clientAddr *net.UDPAddr) (*ClientConnection, error) {
+	c.connMutex.Lock()
+	defer c.connMutex.Unlock()
+
+	// Double-check if connection was created while waiting for lock
+	if conn, exists := c.connections[clientKey]; exists {
+		return conn, nil
+	}
+
+	log.Printf("Creating new SSH connection for client %s", clientKey)
 
 	// Establish SSH connection
-	conn, err := ssh.Dial("tcp", c.config.RemoteAddr, c.sshConfig)
+	sshConn, err := ssh.Dial("tcp", c.config.RemoteAddr, c.sshConfig)
 	if err != nil {
-		return fmt.Errorf("failed to dial SSH: %v", err)
+		return nil, fmt.Errorf("failed to establish SSH connection: %v", err)
 	}
 
-	// Open channel for data transfer
-	channel, reqs, err := conn.OpenChannel("vx-tunnel", nil)
+	// Open channel for UDP tunneling
+	sshChan, reqs, err := sshConn.OpenChannel("vx-tunnel", nil)
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to open SSH channel: %v", err)
+		sshConn.Close()
+		return nil, fmt.Errorf("failed to open SSH channel: %v", err)
 	}
 
+	// Discard incoming requests
 	go ssh.DiscardRequests(reqs)
 
-	c.connMutex.Lock()
-	c.sshConn = conn
-	c.sshChan = channel
-	c.connected = true
-	c.connMutex.Unlock()
+	// Create connection object with buffer pool (optimization)
+	conn := &ClientConnection{
+		udpAddr:    clientAddr,
+		sshConn:    sshConn,
+		sshChan:    sshChan,
+		lastActive: time.Now(),
+	}
 
-	log.Printf("SSH connection established successfully")
-	return nil
+	// Initialize buffer pool for this connection
+	conn.bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 65535)
+		},
+	}
+
+	// Store connection
+	c.connections[clientKey] = conn
+
+	// Start receiving routine for this connection
+	go c.receiveFromSSH(clientKey, conn)
+
+	return conn, nil
 }
 
-// sshSender handles sending packets to SSH (optimized with batching)
-func (c *VXClient) sshSender() {
-	batch := make([]*Packet, 0, 10) // Batch up to 10 packets
-	ticker := time.NewTicker(5 * time.Millisecond) // Send batch every 5ms
+// sendPacket sends a packet through SSH tunnel
+func (c *VXClient) sendPacket(conn *ClientConnection, data []byte) error {
+	// Create packet with client address and data
+	clientAddrBytes := []byte(conn.udpAddr.String())
+	
+	// Calculate total size: 2 bytes addr length + addr + 4 bytes data length + data
+	totalSize := 2 + len(clientAddrBytes) + 4 + len(data)
+	
+	// Get buffer from connection's pool (optimization)
+	buffer := conn.bufferPool.Get().([]byte)
+	defer conn.bufferPool.Put(buffer)
+	
+	// Pack the packet: [addr_len(2)][addr][data_len(4)][data]
+	binary.BigEndian.PutUint16(buffer[0:2], uint16(len(clientAddrBytes)))
+	copy(buffer[2:], clientAddrBytes)
+	binary.BigEndian.PutUint32(buffer[2+len(clientAddrBytes):], uint32(len(data)))
+	copy(buffer[2+len(clientAddrBytes)+4:], data)
+	
+	// Send through SSH channel
+	_, err := conn.sshChan.Write(buffer[:totalSize])
+	return err
+}
+
+// receiveFromSSH handles receiving packets from SSH for a specific connection
+func (c *VXClient) receiveFromSSH(clientKey string, conn *ClientConnection) {
+	defer c.removeConnection(clientKey)
+	
+	buffer := conn.bufferPool.Get().([]byte)
+	defer conn.bufferPool.Put(buffer)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		// Read packet from SSH channel
+		n, err := conn.sshChan.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading from SSH for %s: %v", clientKey, err)
+			}
+			return
+		}
+
+		// Send packet back to UDP client
+		_, err = c.udpListener.WriteToUDP(buffer[:n], conn.udpAddr)
+		if err != nil {
+			log.Printf("Error writing UDP packet to %s: %v", clientKey, err)
+			return
+		}
+
+		// Update last active time
+		conn.mutex.Lock()
+		conn.lastActive = time.Now()
+		conn.mutex.Unlock()
+	}
+}
+
+// removeConnection safely removes a connection
+func (c *VXClient) removeConnection(clientKey string) {
+	c.connMutex.Lock()
+	defer c.connMutex.Unlock()
+
+	if conn, exists := c.connections[clientKey]; exists {
+		log.Printf("Closing connection for client %s", clientKey)
+		conn.sshChan.Close()
+		conn.sshConn.Close()
+		delete(c.connections, clientKey)
+	}
+}
+
+// cleanupRoutine periodically cleans up idle connections
+func (c *VXClient) cleanupRoutine() {
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-
-		case packet := <-c.sendQueue:
-			batch = append(batch, packet)
-			
-			// Send batch if full
-			if len(batch) >= cap(batch) {
-				c.sendBatch(batch)
-				batch = batch[:0] // Reset slice
-			}
-
 		case <-ticker.C:
-			// Send batch on timer
-			if len(batch) > 0 {
-				c.sendBatch(batch)
-				batch = batch[:0] // Reset slice
-			}
+			c.cleanupIdleConnections()
 		}
 	}
 }
 
-// sendBatch sends a batch of packets through SSH (optimized)
-func (c *VXClient) sendBatch(batch []*Packet) {
-	if !c.isConnected() {
-		// Return packets to pool if not connected
-		for _, packet := range batch {
-			c.packetPool.Put(packet)
-		}
-		return
-	}
-
-	// Calculate total size needed
-	totalSize := 0
-	for _, packet := range batch {
-		totalSize += packet.Length + 6 // 2 bytes addr length + 4 bytes data length
-	}
-
-	// Get buffer from pool
-	buffer := c.bufferPool.Get().([]byte)
-	defer c.bufferPool.Put(buffer)
-
-	// Pack multiple packets into single buffer
-	offset := 0
-	for _, packet := range batch {
-		// Write client address length and address
-		addrBytes := []byte(packet.ClientAddr.String())
-		buffer[offset] = byte(len(addrBytes) >> 8)
-		buffer[offset+1] = byte(len(addrBytes))
-		offset += 2
-		copy(buffer[offset:], addrBytes)
-		offset += len(addrBytes)
-
-		// Write data length and data
-		buffer[offset] = byte(packet.Length >> 24)
-		buffer[offset+1] = byte(packet.Length >> 16)
-		buffer[offset+2] = byte(packet.Length >> 8)
-		buffer[offset+3] = byte(packet.Length)
-		offset += 4
-		copy(buffer[offset:], packet.Data[:packet.Length])
-		offset += packet.Length
-
-		// Return packet to pool
-		c.packetPool.Put(packet)
-	}
-
-	// Send entire batch at once
+// cleanupIdleConnections removes connections that have been idle too long
+func (c *VXClient) cleanupIdleConnections() {
 	c.connMutex.RLock()
-	if c.sshChan != nil {
-		c.sshChan.Write(buffer[:offset])
+	var idleConnections []string
+	now := time.Now()
+
+	for clientKey, conn := range c.connections {
+		conn.mutex.RLock()
+		if now.Sub(conn.lastActive) > c.config.IdleTimeout {
+			idleConnections = append(idleConnections, clientKey)
+		}
+		conn.mutex.RUnlock()
 	}
 	c.connMutex.RUnlock()
-}
 
-// sshReceiver handles receiving packets from SSH (optimized)
-func (c *VXClient) sshReceiver() {
-	buffer := make([]byte, 65535)
+	// Remove idle connections
+	for _, clientKey := range idleConnections {
+		c.removeConnection(clientKey)
+	}
 
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		if !c.isConnected() {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		c.connMutex.RLock()
-		sshChan := c.sshChan
-		c.connMutex.RUnlock()
-
-		if sshChan == nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// Read from SSH channel
-		n, err := sshChan.Read(buffer)
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("SSH channel closed, attempting reconnect")
-				c.markDisconnected()
-				continue
-			}
-			log.Printf("Error reading from SSH: %v", err)
-			continue
-		}
-
-		// Parse and queue received packets
-		c.parseReceivedData(buffer[:n])
+	if len(idleConnections) > 0 {
+		log.Printf("Cleaned up %d idle connections", len(idleConnections))
 	}
 }
 
-// parseReceivedData parses batched data from SSH and queues packets
-func (c *VXClient) parseReceivedData(data []byte) {
-	offset := 0
-	
-	for offset < len(data) {
-		if offset+2 > len(data) {
-			break
-		}
-
-		// Read address length
-		addrLen := int(data[offset])<<8 | int(data[offset+1])
-		offset += 2
-
-		if offset+addrLen > len(data) {
-			break
-		}
-
-		// Read address
-		addrStr := string(data[offset : offset+addrLen])
-		offset += addrLen
-
-		if offset+4 > len(data) {
-			break
-		}
-
-		// Read data length
-		dataLen := int(data[offset])<<24 | int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
-		offset += 4
-
-		if offset+dataLen > len(data) {
-			break
-		}
-
-		// Find client address
-		c.clientMutex.RLock()
-		clientAddr, exists := c.clientMap[addrStr]
-		c.clientMutex.RUnlock()
-
-		if !exists {
-			offset += dataLen
-			continue
-		}
-
-		// Create packet for UDP response
-		packet := c.packetPool.Get().(*Packet)
-		packet.ClientAddr = clientAddr
-		packet.Length = dataLen
-		copy(packet.Data[:dataLen], data[offset:offset+dataLen])
-		offset += dataLen
-
-		// Queue for UDP sending
-		select {
-		case c.recvQueue <- packet:
-		default:
-			c.packetPool.Put(packet) // Queue full, drop packet
-		}
-	}
-}
-
-// udpSender handles sending UDP responses to clients
-func (c *VXClient) udpSender() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case packet := <-c.recvQueue:
-			// Send UDP packet to client
-			if _, err := c.udpListener.WriteToUDP(packet.Data[:packet.Length], packet.ClientAddr); err != nil {
-				log.Printf("Error sending UDP to %s: %v", packet.ClientAddr, err)
-			}
-			// Return packet to pool
-			c.packetPool.Put(packet)
-		}
-	}
-}
-
-// reconnectLoop handles SSH reconnection
-func (c *VXClient) reconnectLoop() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		if !c.isConnected() {
-			log.Printf("SSH disconnected, attempting reconnect...")
-			
-			// Close old connection
-			c.closeSSH()
-			
-			// Wait before retry
-			time.Sleep(2 * time.Second)
-			
-			// Attempt reconnect
-			if err := c.connectSSH(); err != nil {
-				log.Printf("Reconnect failed: %v", err)
-				continue
-			}
-			
-			log.Printf("SSH reconnected successfully")
-		}
-		
-		time.Sleep(5 * time.Second)
-	}
-}
-
-// Helper methods for connection state management
-func (c *VXClient) isConnected() bool {
-	c.connMutex.RLock()
-	defer c.connMutex.RUnlock()
-	return c.connected
-}
-
-func (c *VXClient) markDisconnected() {
-	c.connMutex.Lock()
-	c.connected = false
-	c.connMutex.Unlock()
-}
-
-func (c *VXClient) closeSSH() {
-	c.connMutex.Lock()
-	defer c.connMutex.Unlock()
-	
-	if c.sshChan != nil {
-		c.sshChan.Close()
-		c.sshChan = nil
-	}
-	if c.sshConn != nil {
-		c.sshConn.Close()
-		c.sshConn = nil
-	}
-	c.connected = false
-}
-
-// Stop gracefully shuts down the client (optimized)
+// Stop gracefully stops the client
 func (c *VXClient) Stop() {
-	log.Println("Shutting down VX-Client...")
+	log.Printf("Stopping VX-Client...")
+	
+	// Cancel context to stop all goroutines
 	c.cancel()
-
+	
+	// Close all connections
+	c.connMutex.RLock()
+	for clientKey := range c.connections {
+		c.removeConnection(clientKey)
+	}
+	c.connMutex.RUnlock()
+	
 	// Close UDP listener
 	if c.udpListener != nil {
 		c.udpListener.Close()
 	}
-
-	// Close SSH connection
-	c.closeSSH()
-
-	// Close channels
-	close(c.sendQueue)
-	close(c.recvQueue)
-
-	log.Println("VX-Client stopped")
+	
+	log.Printf("VX-Client stopped")
 }
+
+// main function starts the VX-SSH client
 
 func main() {
 	// Command line flags
